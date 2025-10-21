@@ -8,7 +8,7 @@ Library           Collections          # For list counting
 *** Variables ***
 ${FOLDER_NAME}         Flag
 ${TARGET_FOLDER_PATH}  Inbox/${FOLDER_NAME}
-${RECIPIENT_EMAIL}     FollowUp_TAM@sfda.gov.sa
+${RECIPIENT_EMAIL}     aldakheel.career@outlook.com
 
 *** Tasks ***
 Check Flagged Emails and Send Reminders
