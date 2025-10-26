@@ -8,7 +8,6 @@ from exchangelib.items import Message
 import urllib3
 import pytz
 from dotenv import load_dotenv
-
 from outlookHelp import (
     get_riyadh_datetime,
     is_due_soon,
@@ -116,4 +115,86 @@ def main():
 
         try:
             target_folder = account.inbox / FOLDER_NAME
-            print(f"📁 Using folder: {target_folder.name}"_
+            print(f"📁 Using folder: {target_folder.name}")
+        except Exception as e:
+            print(f"❌ Could not find '{FOLDER_NAME}' folder under Inbox: {e}")
+            return
+
+        messages = list(target_folder.all())
+        total_count = len(messages)
+        print(f"📬 Found {total_count} messages in '{FOLDER_NAME}' folder.")
+
+        if total_count == 0:
+            print("ℹ️ No messages found. Exiting.")
+            return
+
+        flagged_count = 0
+        reminder_count = 0
+
+        for msg in messages:
+            try:
+                print(f"\n{'='*60}")
+                print(f"Processing: {msg.subject}")
+                print(f"{'='*60}")
+
+                reminder_is_set = getattr(msg, 'reminder_is_set', None)
+                reminder_due_by = getattr(msg, 'reminder_due_by', None)
+
+                print(f"  reminder_is_set: {reminder_is_set}")
+                print(f"  reminder_due_by: {reminder_due_by}")
+
+                if not reminder_is_set or not reminder_due_by:
+                    print("  ⚠️ Skipping: No reminder or due date.")
+                    continue
+
+                flagged_count += 1
+
+                categories = msg.categories or []
+                if not email_should_be_processed(msg):
+                    print(f"  ⚠️ Already processed ({SENT_CATEGORY} exists). Skipping.")
+                    continue
+
+                is_due = is_due_soon(reminder_due_by, now_riyadh)
+                print(f"  Is due within 2 days? {is_due}")
+
+                if not is_due:
+                    print("  ℹ️ Not due yet. Skipping.")
+                    continue
+
+                recipients = get_original_recipients(msg)
+                if not recipients:
+                    print("  ⚠️ No recipients found. Skipping.")
+                    continue
+
+                subject = get_reminder_subject(msg.subject)
+                due_date_str = format_due_date_for_email(reminder_due_by, now_riyadh.tzinfo)
+                body = get_reminder_body(msg.subject, due_date_str)
+
+                if send_reminder_email(account, recipients, subject, body):
+                    msg.categories = add_sent_category(categories, SENT_CATEGORY)
+                    msg.save(update_fields=['categories'])
+                    reminder_count += 1
+                    print("  ✅ Reminder marked as sent.")
+
+            except Exception as e:
+                print(f"❌ Error processing '{getattr(msg, 'subject', 'unknown')}': {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+        print(f"\n📊 Summary:")
+        print(f"  - Total messages: {total_count}")
+        print(f"  - Flagged with due dates: {flagged_count}")
+        print(f"  - Reminders sent: {reminder_count}")
+
+    except Exception as e:
+        print(f"❌ Error in main process: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+# ================================================
+# 🏁 Entry Point
+# ================================================
+if __name__ == "__main__":
+    main()
