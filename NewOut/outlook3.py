@@ -14,7 +14,6 @@ import io
 from outlookHelp import (
     get_riyadh_datetime,
     is_due_soon,
-    format_due_date_for_email,
     add_sent_category
 )
 
@@ -92,8 +91,8 @@ def get_exchange_account():
 def email_should_be_processed(msg):
     """Check if an email meets all the criteria for processing."""
     try:
-        categories = msg.categories or []
-        return SENT_CATEGORY not in categories
+        categories = [c.lower() for c in (msg.categories or [])]
+        return SENT_CATEGORY.lower() not in categories
     except Exception as e:
         print(f"Error checking email criteria for '{getattr(msg, 'subject', 'unknown')}': {e}")
         return False
@@ -124,6 +123,9 @@ def reply_all_to_original(msg):
         reply = msg.create_reply_all(subject=subject, body=body)
         reply.send()
         print(f"✅ Sent reply-all reminder for: {msg.subject}")
+
+        # Refresh message to update ChangeKey after sending
+        msg.refresh()
         return True
 
     except Exception as e:
@@ -194,10 +196,15 @@ def main():
 
                 # ✅ Reply-all instead of sending a new email
                 if reply_all_to_original(msg):
-                    msg.categories = add_sent_category(categories, SENT_CATEGORY)
-                    msg.save(update_fields=['categories'])
-                    reminder_count += 1
-                    print("  ✅ Reminder marked as sent.")
+                    try:
+                        # Re-fetch to get latest ChangeKey before saving
+                        msg.refresh()
+                        msg.categories = add_sent_category(categories, SENT_CATEGORY)
+                        msg.save(update_fields=['categories'])
+                        reminder_count += 1
+                        print("  ✅ Reminder marked as sent.")
+                    except Exception as e:
+                        print(f"⚠️ Could not save category due to ChangeKey issue: {e}")
 
             except Exception as e:
                 print(f"❌ Error processing '{getattr(msg, 'subject', 'unknown')}': {e}")
