@@ -15,8 +15,6 @@ from outlookHelp import (
     get_riyadh_datetime,
     is_due_soon,
     format_due_date_for_email,
-    get_reminder_subject,
-    get_reminder_body,
     add_sent_category
 )
 
@@ -26,28 +24,20 @@ from outlookHelp import (
 def load_encrypted_env():
     """Load and decrypt the .env file."""
     try:
-        # Get encryption key from environment variable
         encryption_key = os.getenv("ENV_ENCRYPTION_KEY")
-        
         if not encryption_key:
-            # Try .env.key file as fallback
             if os.path.exists('.env.key'):
                 with open('.env.key', 'rb') as f:
                     encryption_key = f.read().decode()
             else:
                 raise ValueError("Encryption key not found! Set ENV_ENCRYPTION_KEY environment variable.")
         
-        # Decrypt .env.encrypted file
         cipher = Fernet(encryption_key.encode())
         with open('.env.encrypted', 'rb') as f:
             encrypted_data = f.read()
-        
         decrypted_data = cipher.decrypt(encrypted_data)
-        
-        # Load into environment
         load_dotenv(stream=io.StringIO(decrypted_data.decode()))
         print("✅ Loaded encrypted environment variables")
-        
     except FileNotFoundError:
         print("⚠️  .env.encrypted not found, trying regular .env file...")
         load_dotenv()
@@ -95,6 +85,7 @@ def get_exchange_account():
     )
     return account
 
+
 # ================================================
 # 📬 Email Processing Helpers
 # ================================================
@@ -108,10 +99,10 @@ def email_should_be_processed(msg):
         return False
 
 
-def reply_all_to_original(msg, body=None):
+def reply_all_to_original(msg):
     """Reply-all to the original message with the reminder body."""
     try:
-        reply = msg.create_reply_all()
+        # Format due date safely
         due_date_str = None
         if hasattr(msg, "reminder_due_by") and msg.reminder_due_by:
             try:
@@ -119,8 +110,8 @@ def reply_all_to_original(msg, body=None):
             except Exception:
                 due_date_str = str(msg.reminder_due_by)
 
-        reply.subject = f"🔔 تذكير بالمتابعة: {msg.subject}"
-        reply.body = (
+        subject = f"🔔 تذكير بالمتابعة: {msg.subject}"
+        body = (
             f"السلام عليكم ورحمة الله وبركاته،\n\n"
             f"نود تذكيركم بأن الرسالة التالية بلغت موعدها المحدد للمتابعة:\n\n"
             f"📩 العنوان: {msg.subject}\n"
@@ -128,11 +119,17 @@ def reply_all_to_original(msg, body=None):
             f"يرجى اتخاذ اللازم.\n\n"
             f"قسم المتابعة - هيئة الغذاء والدواء"
         )
+
+        # ✅ exchangelib requires subject and body
+        reply = msg.create_reply_all(subject=subject, body=body)
         reply.send()
         print(f"✅ Sent reply-all reminder for: {msg.subject}")
         return True
+
     except Exception as e:
         print(f"❌ Error sending reply-all for '{msg.subject}': {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -195,7 +192,7 @@ def main():
                     print("  ℹ️ Not due yet. Skipping.")
                     continue
 
-                # Reply-all instead of sending new email
+                # ✅ Reply-all instead of sending a new email
                 if reply_all_to_original(msg):
                     msg.categories = add_sent_category(categories, SENT_CATEGORY)
                     msg.save(update_fields=['categories'])
