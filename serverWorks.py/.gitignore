@@ -1,0 +1,40 @@
+# =============================
+# 🔐 SECURITY
+# =============================
+# Never upload secret environment files
+.env
+
+# =============================
+# 🐍 PYTHON CACHE / BUILD FILES
+# =============================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.log
+
+# =============================
+# 🧰 ENVIRONMENTS & DEPENDENCIES
+# =============================
+# Virtual environment folders (optional)
+venv/
+.env/
+env/
+.venv/
+
+# =============================
+# 🧱 SYSTEM FILES
+# =============================
+# macOS
+.DS_Store
+# Windows
+Thumbs.db
+desktop.ini
+
+# =============================
+# 📦 IDE / EDITOR FILES
+# =============================
+.vscode/
+.idea/
+*.code-workspace
