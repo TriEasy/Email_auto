@@ -20,9 +20,9 @@ def is_due_soon(due_date_obj, now_in_riyadh):
         
         # Convert due_date to naive datetime
         if hasattr(due_date_obj, 'replace'):
-            due_date_naive = due_date_obj.replace(tzinfo=None)
+            due_date_naive = due_date_obj.replace(tzinfo=None) + 3
         else:
-            due_date_naive = due_date_obj
+            due_date_naive = due_date_obj + 3
         
         # Convert now to naive datetime
         if hasattr(now_in_riyadh, 'replace'):
