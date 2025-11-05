@@ -52,27 +52,23 @@ def is_due_soon(due_date_obj, now_in_riyadh):
 def format_due_date_for_email(due_date_obj, riyadh_tz=None):
     """Formats the due date into a clean string for the email body."""
     try:
-        # Handle EWSDateTime objects
+        # 1. Ensure we have the Riyadh timezone
+        if riyadh_tz is None:
+            riyadh_tz = pytz.timezone('Asia/Riyadh')
+
+        # 2. Handle EWSDateTime/datetime objects
         if hasattr(due_date_obj, 'astimezone'):
-            # Try to convert to Riyadh timezone
-            try:
-                if riyadh_tz is None:
-                    riyadh_tz = pytz.timezone('Asia/Riyadh')
-                
-                # Convert to pytz timezone for formatting
-                if hasattr(due_date_obj, 'tzinfo') and due_date_obj.tzinfo:
-                    # Has timezone info, convert it
-                    due_date_pytz = due_date_obj.replace(tzinfo=pytz.UTC)
-                    due_date_riyadh = due_date_pytz.astimezone(riyadh_tz)
-                    return due_date_riyadh.strftime('%Y-%m-%d %H:%M')
-                else:
-                    # No timezone info, assume it's already in local time
-                    return due_date_obj.strftime('%Y-%m-%d %H:%M')
-            except:
-                # If conversion fails, just format as-is
+            
+            # 3. Check if it's timezone-aware
+            if hasattr(due_date_obj, 'tzinfo') and due_date_obj.tzinfo:
+                # It's aware, so we can safely convert it
+                due_date_riyadh = due_date_obj.astimezone(riyadh_tz)
+                return due_date_riyadh.strftime('%Y-%m-%d %H:%M')
+            else:
+                # It's naive (no timezone). Assume it's already local time.
                 return due_date_obj.strftime('%Y-%m-%d %H:%M')
-        
-        # Fallback - just format as is
+
+        # Fallback for other types
         if hasattr(due_date_obj, 'strftime'):
             return due_date_obj.strftime('%Y-%m-%d %H:%M')
         
