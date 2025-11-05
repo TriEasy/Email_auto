@@ -1,71 +1,73 @@
-# Save this file as: OutlookHelpers.py
+# Save this file as: outlookHelp.py
 import datetime
 import pytz
+from exchangelib import EWSDateTime, EWSTimeZone
 
 def get_riyadh_datetime():
-    """Returns the current datetime in Riyadh (UTC+3) using pytz."""
-    riyadh_tz = pytz.timezone('Asia/Riyadh')
-    return datetime.datetime.now(riyadh_tz)
+    """Returns the current datetime in Riyadh (UTC+3)."""
+    tz = EWSTimeZone.timezone("Asia/Riyadh")
+    return EWSDateTime.now(tz)
 
 def is_due_soon(due_date_obj, now_in_riyadh):
     """
-    Checks if the due date is within the next 2 days.
-    Handles both EWSTimeZone and standard Python timezone objects.
+    Checks if the due date is within the next 2 days, using Riyadh timezone.
     """
     try:
-        # Convert both to UTC for comparison to avoid timezone issues
-        # Get the UTC offset from now_in_riyadh
-        if hasattr(due_date_obj, 'astimezone'):
-            # Convert due date to UTC
-            due_date_utc = due_date_obj.astimezone(pytz.UTC)
-        else:
-            # If it's already naive or can't convert, assume UTC
-            due_date_utc = due_date_obj
-        
-        # Convert current time to UTC
-        now_utc = now_in_riyadh.astimezone(pytz.UTC)
-        
-        # Define the 2-day window
-        two_days_from_now = now_utc + datetime.timedelta(days=2)
-        
-        # Check if due date is between now and 2 days from now
-        result = now_utc <= due_date_utc <= two_days_from_now
-        
-        return result
-    except Exception as e:
-        print(f"Error comparing dates: {e}")
-        # Try a simpler comparison without timezone conversion
-        try:
-            # Remove timezone info and compare
-            if hasattr(due_date_obj, 'replace'):
-                due_date_naive = due_date_obj.replace(tzinfo=None)
-            else:
-                due_date_naive = due_date_obj
-            
-            now_naive = now_in_riyadh.replace(tzinfo=None)
-            two_days_from_now = now_naive + datetime.timedelta(days=2)
-            
-            return now_naive <= due_date_naive <= two_days_from_now
-        except Exception as e2:
-            print(f"Error in fallback comparison: {e2}")
-            return False
+        tz_riyadh = EWSTimeZone.timezone("Asia/Riyadh")
 
-def format_due_date_for_email(due_date_obj, riyadh_tz):
-    """Formats the due date into a clean string for the email body."""
-    try:
-        # Try to convert to Riyadh timezone
-        if hasattr(due_date_obj, 'astimezone'):
-            due_date_riyadh = due_date_obj.astimezone(riyadh_tz)
+        # Convert to Riyadh time if possible
+        if isinstance(due_date_obj, EWSDateTime):
+            due_date_local = due_date_obj.astimezone(tz_riyadh)
         else:
-            due_date_riyadh = due_date_obj
+            due_date_local = EWSDateTime.from_datetime(
+                due_date_obj.astimezone(datetime.timezone.utc)
+            ).astimezone(tz_riyadh)
+
+        now_local = now_in_riyadh
+
+        two_days_from_now = now_local + datetime.timedelta(days=2)
+        is_due = now_local <= due_date_local <= two_days_from_now
+
+        print(f"  🕐 Now (Riyadh): {now_local}")
+        print(f"  🎯 Due (Riyadh): {due_date_local}")
+        print(f"  ⏰ Two days from now: {two_days_from_now}")
+        print(f"  ✓ Is due: {is_due}")
+
+        return is_due
+
+    except Exception as e:
+        print(f"  ⚠️ Error comparing dates: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def format_due_date_for_email(due_date_obj):
+    """Formats the due date into Riyadh time for the reminder email."""
+    try:
+        tz_riyadh = EWSTimeZone.timezone("Asia/Riyadh")
+
+        if isinstance(due_date_obj, EWSDateTime):
+            due_date_riyadh = due_date_obj.astimezone(tz_riyadh)
+        else:
+            # Handle naive datetime or pytz
+            if due_date_obj.tzinfo is None:
+                due_date_obj = pytz.UTC.localize(due_date_obj)
+            due_date_riyadh = EWSDateTime.from_datetime(due_date_obj).astimezone(tz_riyadh)
+
         return due_date_riyadh.strftime('%Y-%m-%d %H:%M')
-    except:
-        # Fallback: just format as-is
-        return due_date_obj.strftime('%Y-%m-%d %H:%M')
+
+    except Exception as e:
+        print(f"  ⚠️ Error formatting date: {e}")
+        import traceback
+        traceback.print_exc()
+        return str(due_date_obj)
+
 
 def get_reminder_subject(original_subject):
     """Returns the formatted subject for the reminder email."""
     return f"🔔 تذكير بالمتابعة: {original_subject}"
+
 
 def get_reminder_body(original_subject, due_date_str):
     """Returns the formatted body for the reminder email."""
@@ -73,33 +75,23 @@ def get_reminder_body(original_subject, due_date_str):
         f"السلام عليكم ورحمة الله وبركاته،\n\n"
         f"نود تذكيركم بأن الرسالة التالية بلغت موعدها المحدد للمتابعة:\n\n"
         f"📩 العنوان: {original_subject}\n"
-        f"📅 الموعد: {due_date_str}\n\n"
+        f"📅 الموعد (بتوقيت الرياض): {due_date_str}\n\n"
         f"يرجى اتخاذ اللازم.\n\n"
         f"قسم المتابعة - هيئة الغذاء والدواء"
     )
 
+
 def add_sent_category(existing_categories, sent_category):
-    """
-    Safely adds the sent category to existing categories.
-    
-    Args:
-        existing_categories: List, tuple, or string of existing categories
-        sent_category: The category string to add
-    
-    Returns:
-        List of categories
-    """
+    """Safely adds the sent category to existing categories."""
     if not existing_categories:
         return [sent_category]
-    
-    # Convert to list if it's a string or tuple
+
     if isinstance(existing_categories, str):
         category_list = [cat.strip() for cat in existing_categories.split(',')]
     else:
         category_list = list(existing_categories)
-    
-    # Add the sent category if not already present
+
     if sent_category not in category_list:
         category_list.append(sent_category)
-    
+
     return category_list
