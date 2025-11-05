@@ -5,13 +5,14 @@ from exchangelib import Credentials, Account, Configuration, DELEGATE
 from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
 from exchangelib.folders import Inbox
 from exchangelib.items import Message
+from exchangelib import Q
 import urllib3
 import pytz
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet
 import io
 
-from reply.outlookHelp import (
+from outlookHelp import (
     get_riyadh_datetime,
     is_due_soon,
     add_sent_category
@@ -86,8 +87,98 @@ def get_exchange_account():
 
 
 # ================================================
-# 📬 Email Processing Helpers
+# 📧 Email Processing Helpers
 # ================================================
+def get_all_recipients(msg):
+    """Extract all unique email addresses from To and CC fields."""
+    recipients = set()
+    
+    # Get To recipients
+    if hasattr(msg, 'to_recipients') and msg.to_recipients:
+        for recipient in msg.to_recipients:
+            if hasattr(recipient, 'email_address'):
+                recipients.add(recipient.email_address.lower())
+    
+    # Get CC recipients
+    if hasattr(msg, 'cc_recipients') and msg.cc_recipients:
+        for recipient in msg.cc_recipients:
+            if hasattr(recipient, 'email_address'):
+                recipients.add(recipient.email_address.lower())
+    
+    return recipients
+
+
+def get_responders_to_message(account, original_msg):
+    """
+    Find all email addresses that have replied to the original message.
+    Searches the entire mailbox for replies based on conversation ID or subject.
+    """
+    responders = set()
+    
+    try:
+        # Method 1: Use conversation_id if available
+        if hasattr(original_msg, 'conversation_id') and original_msg.conversation_id:
+            conversation_id = original_msg.conversation_id
+            
+            # Search inbox for messages in the same conversation
+            replies = account.inbox.filter(conversation_id=conversation_id)
+            
+            for reply in replies:
+                # Skip the original message itself
+                if reply.id == original_msg.id:
+                    continue
+                
+                # Add the sender of the reply
+                if hasattr(reply, 'sender') and reply.sender and hasattr(reply.sender, 'email_address'):
+                    responders.add(reply.sender.email_address.lower())
+        
+        # Method 2: Fallback - search by subject pattern (RE: or FW:)
+        if not responders and hasattr(original_msg, 'subject') and original_msg.subject:
+            subject = original_msg.subject
+            # Look for replies with RE: or FWD: in subject
+            reply_subjects = [
+                f"RE: {subject}",
+                f"Re: {subject}",
+                f"FW: {subject}",
+                f"Fw: {subject}",
+            ]
+            
+            for reply_subject in reply_subjects:
+                replies = account.inbox.filter(subject__contains=subject)
+                
+                for reply in replies:
+                    if reply.id == original_msg.id:
+                        continue
+                    
+                    if hasattr(reply, 'sender') and reply.sender and hasattr(reply.sender, 'email_address'):
+                        responders.add(reply.sender.email_address.lower())
+        
+        print(f"  📊 Found {len(responders)} responders: {responders}")
+        
+    except Exception as e:
+        print(f"  ⚠️ Error finding responders: {e}")
+    
+    return responders
+
+
+def get_non_responders(original_msg, account):
+    """Get list of recipients who haven't responded."""
+    all_recipients = get_all_recipients(original_msg)
+    responders = get_responders_to_message(account, original_msg)
+    
+    # Exclude the sender from recipients (they shouldn't get a reminder)
+    if hasattr(original_msg, 'sender') and original_msg.sender and hasattr(original_msg.sender, 'email_address'):
+        all_recipients.discard(original_msg.sender.email_address.lower())
+    
+    non_responders = all_recipients - responders
+    
+    print(f"  👥 All recipients: {len(all_recipients)}")
+    print(f"  ✅ Responders: {len(responders)}")
+    print(f"  ⏰ Non-responders: {len(non_responders)}")
+    
+    return non_responders
+
+
 def email_should_be_processed(msg):
     """Check if an email meets all the criteria for processing."""
     try:
@@ -98,9 +189,13 @@ def email_should_be_processed(msg):
         return False
 
 
-def reply_all_to_original(msg):
-    """Reply-all to the original message with the reminder body."""
+def send_reminder_to_non_responders(msg, non_responders, account):
+    """Send reminder email only to non-responders."""
     try:
+        if not non_responders:
+            print("  ℹ️ All recipients have responded. No reminder needed.")
+            return True
+        
         # Format due date safely
         due_date_str = None
         if hasattr(msg, "reminder_due_by") and msg.reminder_due_by:
@@ -119,17 +214,24 @@ def reply_all_to_original(msg):
             f"قسم المتابعة - هيئة الغذاء والدواء"
         )
 
-        # ✅ exchangelib requires subject and body
-        reply = msg.create_reply_all(subject=subject, body=body)
-        reply.send()
-        print(f"✅ Sent reply-all reminder for: {msg.subject}")
+        # Create a new message (not a reply) to specific recipients
+        reminder = Message(
+            account=account,
+            subject=subject,
+            body=body,
+            to_recipients=list(non_responders)
+        )
+        
+        reminder.send()
+        print(f"  ✅ Sent reminder to {len(non_responders)} non-responders")
+        print(f"  📧 Recipients: {', '.join(non_responders)}")
 
         # Refresh message to update ChangeKey after sending
         msg.refresh()
         return True
 
     except Exception as e:
-        print(f"❌ Error sending reply-all for '{msg.subject}': {e}")
+        print(f"  ❌ Error sending reminder for '{msg.subject}': {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -194,8 +296,10 @@ def main():
                     print("  ℹ️ Not due yet. Skipping.")
                     continue
 
-                # ✅ Reply-all instead of sending a new email
-                if reply_all_to_original(msg):
+                # ✅ Get non-responders and send reminder only to them
+                non_responders = get_non_responders(msg, account)
+                
+                if send_reminder_to_non_responders(msg, non_responders, account):
                     try:
                         # Re-fetch to get latest ChangeKey before saving
                         msg.refresh()
@@ -224,7 +328,7 @@ def main():
 
 
 # ================================================
-# 🏁 Entry Point
+# 🎯 Entry Point
 # ================================================
 if __name__ == "__main__":
     main()

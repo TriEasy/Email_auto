@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from cryptography.fernet import Fernet
 import io
 
-from outlookHelp import (
+from reply.outlookHelp import (
     get_riyadh_datetime,
     is_due_soon,
     format_due_date_for_email,

@@ -1,10 +1,8 @@
 import os
 import logging
 from datetime import timedelta
-from exchangelib import Credentials, Account, Configuration, DELEGATE
+from exchangelib import Credentials, Account, Configuration, DELEGATE, Message, Q
 from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
-from exchangelib.folders import Inbox
-from exchangelib.items import Message
 import urllib3
 import pytz
 from dotenv import load_dotenv
@@ -14,9 +12,6 @@ import io
 from reply.outlookHelp import (
     get_riyadh_datetime,
     is_due_soon,
-    format_due_date_for_email,
-    get_reminder_subject,
-    get_reminder_body,
     add_sent_category
 )
 
@@ -26,28 +21,20 @@ from reply.outlookHelp import (
 def load_encrypted_env():
     """Load and decrypt the .env file."""
     try:
-        # Get encryption key from environment variable
         encryption_key = os.getenv("ENV_ENCRYPTION_KEY")
-        
         if not encryption_key:
-            # Try .env.key file as fallback
             if os.path.exists('.env.key'):
                 with open('.env.key', 'rb') as f:
                     encryption_key = f.read().decode()
             else:
                 raise ValueError("Encryption key not found! Set ENV_ENCRYPTION_KEY environment variable.")
         
-        # Decrypt .env.encrypted file
         cipher = Fernet(encryption_key.encode())
         with open('.env.encrypted', 'rb') as f:
             encrypted_data = f.read()
-        
         decrypted_data = cipher.decrypt(encrypted_data)
-        
-        # Load into environment
         load_dotenv(stream=io.StringIO(decrypted_data.decode()))
         print("✅ Loaded encrypted environment variables")
-        
     except FileNotFoundError:
         print("⚠️  .env.encrypted not found, trying regular .env file...")
         load_dotenv()
@@ -55,6 +42,7 @@ def load_encrypted_env():
         print(f"❌ Error loading encrypted environment: {e}")
         print("Falling back to regular .env file...")
         load_dotenv()
+
 
 # Load encrypted environment variables
 load_encrypted_env()
@@ -102,23 +90,84 @@ def get_exchange_account():
 def email_should_be_processed(msg):
     """Check if an email meets all the criteria for processing."""
     try:
-        categories = msg.categories or []
-        return SENT_CATEGORY not in categories
+        categories = [c.lower() for c in (msg.categories or [])]
+        return SENT_CATEGORY.lower() not in categories
     except Exception as e:
         print(f"Error checking email criteria for '{getattr(msg, 'subject', 'unknown')}': {e}")
         return False
 
 
-def send_reply_all(msg, body):
-    """Reply all to the original message."""
+# ================================================
+# 🧠 Helper: Identify Non-Responders
+# ================================================
+def get_non_responders(account, original_msg):
+    """Return list of recipients (To + CC) who have not replied to the original email."""
     try:
-        # Create a reply all
-        reply = msg.reply_all(subject=msg.subject, body=body)
-        reply.send()
-        print(f"✅ Reply All sent successfully for: {msg.subject}")
-        return True
+        all_recipients = set()
+        for r in (original_msg.to_recipients or []):
+            if hasattr(r, "email_address") and r.email_address:
+                all_recipients.add(r.email_address.lower())
+        for r in (original_msg.cc_recipients or []):
+            if hasattr(r, "email_address") and r.email_address:
+                all_recipients.add(r.email_address.lower())
+
+        conversation_id = getattr(original_msg, 'conversation_id', None)
+        subject = original_msg.subject or ""
+
+        replied_senders = set()
+        if conversation_id:
+            related_msgs = account.inbox.filter(conversation_id=conversation_id)
+        else:
+            related_msgs = account.inbox.filter(subject__contains=subject)
+
+        for m in related_msgs:
+            if m.id != original_msg.id and m.sender:
+                replied_senders.add(m.sender.email_address.lower())
+
+        non_responders = [r for r in all_recipients if r not in replied_senders]
+        return non_responders
+
     except Exception as e:
-        print(f"❌ Error sending Reply All: {e}")
+        print(f"⚠️ Error determining non-responders: {e}")
+        return []
+
+
+# ================================================
+# 📤 Send Reminder to Non-Responders
+# ================================================
+def send_reminder_to_non_responders(account, msg):
+    """Send reminder email only to non-responders."""
+    try:
+        non_responders = get_non_responders(account, msg)
+        if not non_responders:
+            print("✅ Everyone replied — skipping reminder.")
+            return False
+
+        due_date_str = msg.reminder_due_by.strftime('%Y-%m-%d %H:%M') if msg.reminder_due_by else "غير محدد"
+        subject = f"🔔 تذكير بالمتابعة: {msg.subject}"
+        body = (
+            f"السلام عليكم ورحمة الله وبركاته،\n\n"
+            f"نود تذكيركم بأن الرسالة التالية بلغت موعدها المحدد للمتابعة:\n\n"
+            f"📩 العنوان: {msg.subject}\n"
+            f"📅 الموعد: {due_date_str}\n\n"
+            f"يرجى اتخاذ اللازم.\n\n"
+            f"قسم المتابعة - هيئة الغذاء والدواء"
+        )
+
+        new_msg = Message(
+            account=account,
+            subject=subject,
+            body=body,
+            to_recipients=list(non_responders)
+        )
+        new_msg.send_and_save()
+        print(f"✅ Sent reminder to non-responders: {', '.join(non_responders)}")
+        return True
+
+    except Exception as e:
+        print(f"❌ Error sending reminder to non-responders for '{msg.subject}': {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -181,16 +230,16 @@ def main():
                     print("  ℹ️ Not due yet. Skipping.")
                     continue
 
-                # Format the reminder body
-                due_date_str = format_due_date_for_email(reminder_due_by, now_riyadh.tzinfo)
-                body = get_reminder_body(msg.subject, due_date_str)
-
-                # Send reply all instead of new email
-                if send_reply_all(msg, body):
-                    msg.categories = add_sent_category(categories, SENT_CATEGORY)
-                    msg.save(update_fields=['categories'])
-                    reminder_count += 1
-                    print("  ✅ Reminder marked as sent.")
+                # ✅ Send reminder only to non-responders
+                if send_reminder_to_non_responders(account, msg):
+                    try:
+                        msg.refresh()
+                        msg.categories = add_sent_category(categories, SENT_CATEGORY)
+                        msg.save(update_fields=['categories'])
+                        reminder_count += 1
+                        print("  ✅ Reminder marked as sent.")
+                    except Exception as e:
+                        print(f"⚠️ Could not save category due to ChangeKey issue: {e}")
 
             except Exception as e:
                 print(f"❌ Error processing '{getattr(msg, 'subject', 'unknown')}': {e}")
@@ -210,7 +259,7 @@ def main():
 
 
 # ================================================
-# 🎯 Entry Point
+# 🏁 Entry Point
 # ================================================
 if __name__ == "__main__":
     main()
