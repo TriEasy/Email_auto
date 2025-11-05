@@ -3,33 +3,76 @@ import logging
 from datetime import timedelta
 from exchangelib import Credentials, Account, Configuration, DELEGATE
 from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
-from exchangelib.folders import Calendar, Contacts, Tasks, Inbox
+from exchangelib.folders import Inbox
 from exchangelib.items import Message
+from exchangelib import Q
+import urllib3
 import pytz
-# Assuming outlookhelpers2.py contains the original helper functions
-from OutlookHelper import (
+from dotenv import load_dotenv
+from cryptography.fernet import Fernet
+import io
+
+from outlookHelp import (
     get_riyadh_datetime,
     is_due_soon,
-    format_due_date_for_email,
-    get_reminder_subject,
-    get_reminder_body,
-    add_sent_category
+    add_sent_category,
+    format_due_date_for_email
 )
 
-# Configuration
-EXCHANGE_USERNAME = "example"
-EXCHANGE_PASSWORD = "example"
-EXCHANGE_EMAIL = "example@sfda.gov.sa"
-EXCHANGE_URL = 'example'
+# ================================================
+# 🔐 Secure Configuration (Encrypted)
+# ================================================
+def load_encrypted_env():
+    """Load and decrypt the .env file."""
+    try:
+        encryption_key = os.getenv("ENV_ENCRYPTION_KEY")
+        if not encryption_key:
+            if os.path.exists('.env.key'):
+                with open('.env.key', 'rb') as f:
+                    encryption_key = f.read().decode()
+            else:
+                raise ValueError("Encryption key not found! Set ENV_ENCRYPTION_KEY environment variable.")
+        
+        cipher = Fernet(encryption_key.encode())
+        with open('.env.encrypted', 'rb') as f:
+            encrypted_data = f.read()
+        decrypted_data = cipher.decrypt(encrypted_data)
+        load_dotenv(stream=io.StringIO(decrypted_data.decode()))
+        print("✅ Loaded encrypted environment variables")
+    except FileNotFoundError:
+        print("⚠️  .env.encrypted not found, trying regular .env file...")
+        load_dotenv()
+    except Exception as e:
+        print(f"❌ Error loading encrypted environment: {e}")
+        print("Falling back to regular .env file...")
+        load_dotenv()
+
+# Load encrypted environment variables
+load_encrypted_env()
+
+EXCHANGE_USERNAME = os.getenv("EXCHANGE_USERNAME")
+EXCHANGE_PASSWORD = os.getenv("EXCHANGE_PASSWORD")
+EXCHANGE_EMAIL = os.getenv("EXCHANGE_EMAIL")
+EXCHANGE_URL = os.getenv("EXCHANGE_URL")
 
 FOLDER_NAME = "Flag"
 SENT_CATEGORY = "AutoReminderSent"
 
+if not all([EXCHANGE_USERNAME, EXCHANGE_PASSWORD, EXCHANGE_EMAIL, EXCHANGE_URL]):
+    raise ValueError(
+        "Missing Exchange environment variables. Please set EXCHANGE_USERNAME, "
+        "EXCHANGE_PASSWORD, EXCHANGE_EMAIL, and EXCHANGE_URL."
+    )
+
+# ================================================
+# ⚙️ Logging & Security
+# ================================================
 logging.basicConfig(level=logging.WARNING)
-import urllib3
 urllib3.disable_warnings()
 
-
+# ================================================
+# 🔧 Exchange Connection
+# ================================================
 def get_exchange_account():
     """Establish connection to the Exchange account."""
     BaseProtocol.HTTP_ADAPTER_CLS = NoVerifyHTTPAdapter
@@ -44,176 +87,213 @@ def get_exchange_account():
     return account
 
 
+# ================================================
+# 📧 Email Processing Helpers
+# ================================================
+def get_all_recipients(msg):
+    """Extract all unique email addresses from To and CC fields."""
+    recipients = set()
+    
+    if hasattr(msg, 'to_recipients') and msg.to_recipients:
+        for recipient in msg.to_recipients:
+            if hasattr(recipient, 'email_address'):
+                recipients.add(recipient.email_address.lower())
+    
+    if hasattr(msg, 'cc_recipients') and msg.cc_recipients:
+        for recipient in msg.cc_recipients:
+            if hasattr(recipient, 'email_address'):
+                recipients.add(recipient.email_address.lower())
+    
+    return recipients
+
+
+def get_responders_to_message(account, original_msg):
+    """
+    Find all email addresses that have replied to the original message.
+    Searches the entire mailbox for replies based on conversation ID or subject.
+    """
+    responders = set()
+    try:
+        # Method 1: Use conversation_id
+        if hasattr(original_msg, 'conversation_id') and original_msg.conversation_id:
+            conversation_id = original_msg.conversation_id
+            replies = account.inbox.filter(conversation_id=conversation_id)
+            
+            for reply in replies:
+                if reply.id == original_msg.id:
+                    continue
+                if hasattr(reply, 'sender') and reply.sender and hasattr(reply.sender, 'email_address'):
+                    responders.add(reply.sender.email_address.lower())
+
+        # Method 2: Fallback - search by subject
+        if not responders and hasattr(original_msg, 'subject') and original_msg.subject:
+            subject = original_msg.subject
+            replies = account.inbox.filter(subject__contains=subject)
+            for reply in replies:
+                if reply.id == original_msg.id:
+                    continue
+                if hasattr(reply, 'sender') and reply.sender and hasattr(reply.sender, 'email_address'):
+                    responders.add(reply.sender.email_address.lower())
+
+        print(f"  📊 Found {len(responders)} responders: {responders}")
+
+    except Exception as e:
+        print(f"  ⚠️ Error finding responders: {e}")
+
+    return responders
+
+
+def get_non_responders(original_msg, account):
+    """Get list of recipients who haven't responded."""
+    all_recipients = get_all_recipients(original_msg)
+    responders = get_responders_to_message(account, original_msg)
+    
+    if hasattr(original_msg, 'sender') and original_msg.sender and hasattr(original_msg.sender, 'email_address'):
+        all_recipients.discard(original_msg.sender.email_address.lower())
+    
+    non_responders = all_recipients - responders
+    
+    print(f"  👥 All recipients: {len(all_recipients)}")
+    print(f"  ✅ Responders: {len(responders)}")
+    print(f"  ⏰ Non-responders: {len(non_responders)}")
+    
+    return non_responders
+
+
 def email_should_be_processed(msg):
     """Check if an email meets all the criteria for processing."""
     try:
-        categories = msg.categories or []
-        if SENT_CATEGORY in categories:
-            return False
-        return True
+        categories = [c.lower() for c in (msg.categories or [])]
+        return SENT_CATEGORY.lower() not in categories
     except Exception as e:
-        print(f"Error checking email criteria for '{msg.subject if hasattr(msg, 'subject') else 'unknown'}': {e}")
+        print(f"Error checking email criteria for '{getattr(msg, 'subject', 'unknown')}': {e}")
         return False
 
 
-def get_original_recipients(msg):
-    """Extract all original recipients from the email."""
-    recipients = []
-    for recipient_field in [msg.to_recipients, msg.cc_recipients, msg.bcc_recipients]:
-        if recipient_field:
-            for recipient in recipient_field:
-                if recipient.email_address:
-                    recipients.append(recipient.email_address)
-    
-    seen = set()
-    unique_recipients = []
-    for email in recipients:
-        if email.lower() not in seen:
-            seen.add(email.lower())
-            unique_recipients.append(email)
-    
-    return "; ".join(unique_recipients)
-
-
-def send_reminder_email(account, recipients, subject, body):
-    """Create and send a new email using exchangelib."""
+def send_reminder_to_non_responders(msg, non_responders, account):
+    """Send reminder email as a reply only to non-responders."""
     try:
-        mail = Message(
-            account=account,
-            subject=subject,
-            body=body
+        if not non_responders:
+            print("  ℹ️ All recipients have responded. No reminder needed.")
+            return True
+        
+        # Format due date in Riyadh time
+        due_date_str = None
+        if hasattr(msg, "reminder_due_by") and msg.reminder_due_by:
+            due_date_str = format_due_date_for_email(msg.reminder_due_by)
+
+        subject = f"🔔 تذكير بالمتابعة: {msg.subject}"
+        body = (
+            f"السلام عليكم ورحمة الله وبركاته،\n\n"
+            f"نود تذكيركم بأن الرسالة التالية بلغت موعدها المحدد للمتابعة:\n\n"
+            f"📩 العنوان: {msg.subject}\n"
+            f"📅 الموعد (بتوقيت الرياض): {due_date_str or 'غير محدد'}\n\n"
+            f"يرجى اتخاذ اللازم.\n\n"
+            f"قسم المتابعة - هيئة الغذاء والدواء"
         )
-        mail.to_recipients = recipients.split('; ')
-        mail.send()
-        print(f"Reminder sent successfully to: {recipients}")
+
+        # Create reply
+        reply = msg.create_reply_all(subject=subject, body=body)
+        reply.to_recipients = list(non_responders)
+        reply.cc_recipients = []
+        reply.send()
+
+        print(f"  ✅ Sent reminder to {len(non_responders)} non-responders")
+        print(f"  📧 Recipients: {', '.join(non_responders)}")
+        msg.refresh()
         return True
+
     except Exception as e:
-        print(f"Error sending email via EWS: {e}")
+        print(f"  ❌ Error sending reminder for '{msg.subject}': {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
+# ================================================
+# 🚀 Main Logic
+# ================================================
 def main():
     """Main function to check flagged emails and send reminders."""
-    print("Starting Exchange reminder process...")
-    
+    print("🔄 Starting Exchange reminder process...")
+
     try:
         account = get_exchange_account()
         now_riyadh = get_riyadh_datetime()
-        
+
         try:
-            target_folder = account.inbox / "Flag"
-            print(f"Using folder: {target_folder.name}")
+            target_folder = account.inbox / FOLDER_NAME
+            print(f"📁 Using folder: {target_folder.name}")
         except Exception as e:
-            print(f"Could not find Flag folder under Inbox: {e}")
+            print(f"❌ Could not find '{FOLDER_NAME}' folder: {e}")
             return
-        
-        # ✅ FIXED: Use .all() without field restrictions to get all message data
-        # We'll retrieve messages and let exchangelib load all fields automatically
+
         messages = list(target_folder.all())
-        
-        total_count = len(messages)
-        print(f"Found {total_count} messages in '{FOLDER_NAME}' folder.")
-        
-        if total_count == 0:
-            print("No messages found in folder. Exiting.")
-            return
-        
-        # Count messages with due dates
+        print(f"📬 Found {len(messages)} messages in '{FOLDER_NAME}'.")
+
         flagged_count = 0
         reminder_count = 0
-        
-        # Process each message - check for reminder properties
+
         for msg in messages:
             try:
-                # Debug: Print what we're seeing
                 print(f"\n{'='*60}")
                 print(f"Processing: {msg.subject}")
                 print(f"{'='*60}")
-                
-                # Check for reminder properties (the actual properties used by Exchange)
+
                 reminder_is_set = getattr(msg, 'reminder_is_set', None)
                 reminder_due_by = getattr(msg, 'reminder_due_by', None)
-                
+
                 print(f"  reminder_is_set: {reminder_is_set}")
-                print(f"  reminder_due_by: {reminder_due_by}")
-                
-                # Skip if no reminder is set
-                if not reminder_is_set:
-                    print(f"  ⚠️ No reminder set - SKIPPING")
+                print(f"  reminder_due_by (UTC): {reminder_due_by}")
+
+                if not reminder_is_set or not reminder_due_by:
+                    print("  ⚠️ Skipping: No reminder set.")
                     continue
-                
-                # Skip if no due date
-                if not reminder_due_by:
-                    print(f"  ⚠️ Reminder set but no due date - SKIPPING")
-                    continue
-                
+
                 flagged_count += 1
-                print(f"  ✅ Has reminder with due date: {reminder_due_by}")
-                
-                # Check categories
-                categories = msg.categories or []
-                print(f"  Current categories: {categories}")
-                print(f"  Has {SENT_CATEGORY}? {SENT_CATEGORY in categories}")
-                
-                # Check if already processed
-                if email_should_be_processed(msg):
-                    print(f"  → Proceeding to check if due soon and send reminder...")
-                    print(f"  Current Riyadh time: {now_riyadh}")
-                    
-                    # Check if due soon (within 2 days)
-                    is_due = is_due_soon(reminder_due_by, now_riyadh)
-                    print(f"  Is due within 2 days? {is_due}")
-                    
-                    if is_due:
-                        # Get recipients
-                        original_recipients = get_original_recipients(msg)
-                        
-                        if not original_recipients:
-                            print(f"  ⚠️ No recipients found. Skipping.")
-                            continue
-                        
-                        print(f"  Recipients: {original_recipients}")
-                        
-                        # Send reminder
-                        subject = get_reminder_subject(msg.subject)
-                        due_date_str = format_due_date_for_email(reminder_due_by, now_riyadh.tzinfo)
-                        body = get_reminder_body(msg.subject, due_date_str)
-                        
-                        email_sent = send_reminder_email(account, original_recipients, subject, body)
-                        
-                        if email_sent:
-                            # Mark as sent
-                            current_categories = msg.categories or []
-                            new_categories_list = add_sent_category(current_categories, SENT_CATEGORY)
-                            msg.categories = new_categories_list
-                            msg.save(update_fields=['categories'])
-                            
-                            reminder_count += 1
-                            print(f"  ✅ REMINDER SENT SUCCESSFULLY")
-                        else:
-                            print(f"  ❌ Failed to send reminder")
-                    else:
-                        print(f"  ℹ️ Not due within 2 days yet")
-                else:
-                    print(f"  ⚠️ Already processed (has {SENT_CATEGORY} category)")
-                        
+
+                # Show Riyadh time in logs
+                try:
+                    riyadh_time_str = format_due_date_for_email(reminder_due_by)
+                    print(f"  reminder_due_by (Riyadh): {riyadh_time_str}")
+                except Exception as e:
+                    print(f"  ⚠️ Could not format Riyadh time: {e}")
+
+                if not email_should_be_processed(msg):
+                    print(f"  ⚠️ Already processed ({SENT_CATEGORY}). Skipping.")
+                    continue
+
+                if not is_due_soon(reminder_due_by, now_riyadh):
+                    print("  ℹ️ Not due yet. Skipping.")
+                    continue
+
+                non_responders = get_non_responders(msg, account)
+                if send_reminder_to_non_responders(msg, non_responders, account):
+                    msg.refresh()
+                    msg.categories = add_sent_category(msg.categories or [], SENT_CATEGORY)
+                    msg.save(update_fields=['categories'])
+                    reminder_count += 1
+                    print("  ✅ Reminder marked as sent.")
+
             except Exception as e:
-                print(f"❌ Error processing message '{getattr(msg, 'subject', 'unknown')}': {e}")
+                print(f"❌ Error processing '{getattr(msg, 'subject', 'unknown')}': {e}")
                 import traceback
                 traceback.print_exc()
                 continue
-        
+
         print(f"\n📊 Summary:")
-        print(f"  - Total messages in folder: {total_count}")
+        print(f"  - Total messages: {len(messages)}")
         print(f"  - Flagged with due dates: {flagged_count}")
         print(f"  - Reminders sent: {reminder_count}")
-    
+
     except Exception as e:
-        print(f"Error in main process: {e}")
+        print(f"❌ Error in main process: {e}")
         import traceback
         traceback.print_exc()
-        raise
 
 
+# ================================================
+# 🎯 Entry Point
+# ================================================
 if __name__ == "__main__":
     main()
