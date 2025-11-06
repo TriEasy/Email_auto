@@ -189,12 +189,16 @@ def send_reminder_to_non_responders(msg, non_responders, account):
             f"قسم المتابعة - هيئة الغذاء والدواء"
         )
 
-        # Create a simple reply (not reply_all) to avoid including CC automatically
-        reply = msg.reply(subject=subject, body=body)
-        # Explicitly set only the non-responders from To field
+        # Use create_reply() instead of create_reply_all() to avoid automatic CC inclusion
+        reply = msg.create_reply(subject=subject, body=body)
+        
+        # Manually set only the non-responders from To field
         reply.to_recipients = list(non_responders)
-        # Ensure CC is empty
+        
+        # Explicitly clear CC and BCC recipients
         reply.cc_recipients = []
+        reply.bcc_recipients = []
+        
         reply.send()
 
         print(f"  ✅ Sent reminder to {len(non_responders)} non-responders (To only)")
