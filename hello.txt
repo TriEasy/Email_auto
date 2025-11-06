@@ -1,0 +1,139 @@
+encrypt_env.py
+Inputs:
+
+Source: .env file (plaintext environment variables)
+Format: Text file with KEY=VALUE pairs
+Path: Current directory (./env)
+
+Transformation:
+
+Parsing: Reads file as binary data
+Validation: Checks if .env file exists
+Enrichment:
+
+Generates Fernet encryption key
+Encrypts entire .env contents using symmetric encryption
+Displays security instructions to user
+
+
+
+Outputs:
+
+Destinations:
+
+.env.encrypted (encrypted environment variables)
+.env.key (encryption key)
+Console output (key display + instructions)
+
+
+Formats: Both output files are binary
+
+
+outlook.py
+Inputs:
+
+Sources:
+
+.env.encrypted file OR .env file (fallback)
+.env.key file OR ENV_ENCRYPTION_KEY environment variable
+Exchange Server mailbox (via exchangelib API)
+
+
+Formats:
+
+Binary encrypted file (.env.encrypted)
+Email messages from Exchange Server
+
+
+Paths:
+
+Current directory for env files
+Exchange folder: "Flag" (configurable via FOLDER_NAME)
+
+
+
+Transformation:
+
+Parsing:
+
+Decrypts .env.encrypted using Fernet cipher
+Parses email messages from Exchange Server
+Extracts: recipients, conversation IDs, subjects, reminder dates
+
+
+Validation:
+
+Checks if reminder is set on email
+Verifies due date exists
+Confirms email hasn't been processed (AutoReminderSent category check)
+Validates due date is within 2-day window
+
+
+Enrichment:
+
+Identifies non-responders by comparing To recipients vs. conversation replies
+Converts UTC times to Riyadh timezone (Asia/Riyadh)
+Formats due dates for Arabic email body
+Generates reminder email content in Arabic
+
+
+
+Outputs:
+
+Destination: Exchange Server (sent emails)
+Formats:
+
+Email messages (reply-all to original thread)
+Updated email categories (AutoReminderSent tag added)
+
+
+Recipients: Only non-responders from original "To" field (CC excluded)
+Console logging: Processing status and statistics
+
+
+outlookHelp.py
+Inputs:
+
+Sources: Function parameters from outlook.py:
+
+due_date_obj (EWSDateTime or datetime)
+now_in_riyadh (EWSDateTime)
+original_subject (string)
+existing_categories (list/string)
+
+
+Format: Python objects (datetime, strings, lists)
+
+Transformation:
+
+Parsing:
+
+Handles multiple datetime formats (EWSDateTime, Python datetime, ISO strings)
+Normalizes timezone information
+
+
+Validation:
+
+Checks timezone awareness
+Verifies date comparison validity
+Handles missing/malformed date objects
+
+
+Enrichment:
+
+Timezone conversion (UTC → Riyadh)
+Date arithmetic (2-day window calculation)
+Arabic text formatting for emails
+Category list management
+
+
+
+Outputs:
+
+Destinations: Return values to calling functions in outlook.py
+Formats:
+
+EWSDateTime objects (timezone-aware)
+Boolean values (due date checks)
+Formatted strings (Arabic email content, dates as 'YYYY-MM-DD HH:MM')
+Updated category lists
