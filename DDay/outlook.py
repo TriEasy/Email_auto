@@ -1,18 +1,22 @@
 import os
 import logging
 from datetime import timedelta
-from exchangelib import Credentials, Account, Configuration, DELEGATE, Message, Q
+from exchangelib import Credentials, Account, Configuration, DELEGATE
 from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
+from exchangelib.folders import Inbox
+from exchangelib.items import Message
+from exchangelib import Q
 import urllib3
 import pytz
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet
 import io
 
-from reply.outlookHelp import (
+from outlookHelp import (
     get_riyadh_datetime,
     is_due_soon,
-    add_sent_category
+    add_sent_category,
+    format_due_date_for_email
 )
 
 # ================================================
@@ -43,7 +47,6 @@ def load_encrypted_env():
         print("Falling back to regular .env file...")
         load_dotenv()
 
-
 # Load encrypted environment variables
 load_encrypted_env()
 
@@ -68,7 +71,7 @@ logging.basicConfig(level=logging.WARNING)
 urllib3.disable_warnings()
 
 # ================================================
-# 🔧 Exchange Connection
+# 📧 Exchange Connection
 # ================================================
 def get_exchange_account():
     """Establish connection to the Exchange account."""
@@ -85,8 +88,75 @@ def get_exchange_account():
 
 
 # ================================================
-# 📬 Email Processing Helpers
+# 📧 Email Processing Helpers
 # ================================================
+def get_to_recipients_only(msg):
+    """Extract all unique email addresses from To field only (excluding CC)."""
+    recipients = set()
+    
+    if hasattr(msg, 'to_recipients') and msg.to_recipients:
+        for recipient in msg.to_recipients:
+            if hasattr(recipient, 'email_address'):
+                recipients.add(recipient.email_address.lower())
+    
+    return recipients
+
+
+def get_responders_to_message(account, original_msg):
+    """
+    Find all email addresses that have replied to the original message.
+    Searches the entire mailbox for replies based on conversation ID or subject.
+    """
+    responders = set()
+    try:
+        # Method 1: Use conversation_id
+        if hasattr(original_msg, 'conversation_id') and original_msg.conversation_id:
+            conversation_id = original_msg.conversation_id
+            replies = account.inbox.filter(conversation_id=conversation_id)
+            
+            for reply in replies:
+                if reply.id == original_msg.id:
+                    continue
+                if hasattr(reply, 'sender') and reply.sender and hasattr(reply.sender, 'email_address'):
+                    responders.add(reply.sender.email_address.lower())
+
+        # Method 2: Fallback - search by subject
+        if not responders and hasattr(original_msg, 'subject') and original_msg.subject:
+            subject = original_msg.subject
+            replies = account.inbox.filter(subject__contains=subject)
+            for reply in replies:
+                if reply.id == original_msg.id:
+                    continue
+                if hasattr(reply, 'sender') and reply.sender and hasattr(reply.sender, 'email_address'):
+                    responders.add(reply.sender.email_address.lower())
+
+        print(f"  📊 Found {len(responders)} responders: {responders}")
+
+    except Exception as e:
+        print(f"  ⚠️ Error finding responders: {e}")
+
+    return responders
+
+
+def get_non_responders(original_msg, account):
+    """Get list of To recipients (only) who haven't responded."""
+    # Only get To recipients, excluding CC
+    to_recipients = get_to_recipients_only(original_msg)
+    responders = get_responders_to_message(account, original_msg)
+    
+    # Remove the original sender from recipients
+    if hasattr(original_msg, 'sender') and original_msg.sender and hasattr(original_msg.sender, 'email_address'):
+        to_recipients.discard(original_msg.sender.email_address.lower())
+    
+    non_responders = to_recipients - responders
+    
+    print(f"  👥 To recipients: {len(to_recipients)}")
+    print(f"  ✅ Responders: {len(responders)}")
+    print(f"  ⏰ Non-responders (To only): {len(non_responders)}")
+    
+    return non_responders
+
+
 def email_should_be_processed(msg):
     """Check if an email meets all the criteria for processing."""
     try:
@@ -97,73 +167,43 @@ def email_should_be_processed(msg):
         return False
 
 
-# ================================================
-# 🧠 Helper: Identify Non-Responders (TO only)
-# ================================================
-def get_non_responders(account, original_msg):
-    """Return list of recipients (TO only) who have not replied to the original email."""
+def send_reminder_to_non_responders(msg, non_responders, account):
+    """Send reminder email as a reply only to non-responders from To field."""
     try:
-        # ✅ Only include 'To' recipients — ignore CC
-        all_recipients = set()
-        for r in (original_msg.to_recipients or []):
-            if hasattr(r, "email_address") and r.email_address:
-                all_recipients.add(r.email_address.lower())
-
-        conversation_id = getattr(original_msg, 'conversation_id', None)
-        subject = original_msg.subject or ""
-
-        replied_senders = set()
-        if conversation_id:
-            related_msgs = account.inbox.filter(conversation_id=conversation_id)
-        else:
-            related_msgs = account.inbox.filter(subject__contains=subject)
-
-        for m in related_msgs:
-            if m.id != original_msg.id and m.sender:
-                replied_senders.add(m.sender.email_address.lower())
-
-        non_responders = [r for r in all_recipients if r not in replied_senders]
-        return non_responders
-
-    except Exception as e:
-        print(f"⚠️ Error determining non-responders: {e}")
-        return []
-
-
-# ================================================
-# 📤 Send Reminder to Non-Responders
-# ================================================
-def send_reminder_to_non_responders(account, msg):
-    """Send reminder email only to TO recipients who have not replied."""
-    try:
-        non_responders = get_non_responders(account, msg)
         if not non_responders:
-            print("✅ Everyone in TO replied — skipping reminder.")
-            return False
+            print("  ℹ️ All To recipients have responded. No reminder needed.")
+            return True
+        
+        # Format due date in Riyadh time
+        due_date_str = None
+        if hasattr(msg, "reminder_due_by") and msg.reminder_due_by:
+            due_date_str = format_due_date_for_email(msg.reminder_due_by)
 
-        due_date_str = msg.reminder_due_by.strftime('%Y-%m-%d %H:%M') if msg.reminder_due_by else "غير محدد"
         subject = f"🔔 تذكير بالمتابعة: {msg.subject}"
         body = (
             f"السلام عليكم ورحمة الله وبركاته،\n\n"
             f"نود تذكيركم بأن الرسالة التالية بلغت موعدها المحدد للمتابعة:\n\n"
             f"📩 العنوان: {msg.subject}\n"
-            f"📅 الموعد: {due_date_str}\n\n"
+            f"📅 الموعد (بتوقيت الرياض): {due_date_str or 'غير محدد'}\n\n"
             f"يرجى اتخاذ اللازم.\n\n"
             f"قسم المتابعة - هيئة الغذاء والدواء"
         )
 
-        new_msg = Message(
-            account=account,
-            subject=subject,
-            body=body,
-            to_recipients=list(non_responders)
-        )
-        new_msg.send_and_save()
-        print(f"✅ Sent reminder to non-responders (TO only): {', '.join(non_responders)}")
+        # Create a simple reply (not reply_all) to avoid including CC automatically
+        reply = msg.reply(subject=subject, body=body)
+        # Explicitly set only the non-responders from To field
+        reply.to_recipients = list(non_responders)
+        # Ensure CC is empty
+        reply.cc_recipients = []
+        reply.send()
+
+        print(f"  ✅ Sent reminder to {len(non_responders)} non-responders (To only)")
+        print(f"  📧 Recipients: {', '.join(non_responders)}")
+        msg.refresh()
         return True
 
     except Exception as e:
-        print(f"❌ Error sending reminder to non-responders for '{msg.subject}': {e}")
+        print(f"  ❌ Error sending reminder for '{msg.subject}': {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -184,16 +224,11 @@ def main():
             target_folder = account.inbox / FOLDER_NAME
             print(f"📁 Using folder: {target_folder.name}")
         except Exception as e:
-            print(f"❌ Could not find '{FOLDER_NAME}' folder under Inbox: {e}")
+            print(f"❌ Could not find '{FOLDER_NAME}' folder: {e}")
             return
 
         messages = list(target_folder.all())
-        total_count = len(messages)
-        print(f"📬 Found {total_count} messages in '{FOLDER_NAME}' folder.")
-
-        if total_count == 0:
-            print("ℹ️ No messages found. Exiting.")
-            return
+        print(f"📬 Found {len(messages)} messages in '{FOLDER_NAME}'.")
 
         flagged_count = 0
         reminder_count = 0
@@ -208,36 +243,36 @@ def main():
                 reminder_due_by = getattr(msg, 'reminder_due_by', None)
 
                 print(f"  reminder_is_set: {reminder_is_set}")
-                print(f"  reminder_due_by: {reminder_due_by}")
+                print(f"  reminder_due_by (UTC): {reminder_due_by}")
 
                 if not reminder_is_set or not reminder_due_by:
-                    print("  ⚠️ Skipping: No reminder or due date.")
+                    print("  ⚠️ Skipping: No reminder set.")
                     continue
 
                 flagged_count += 1
 
-                categories = msg.categories or []
+                # Show Riyadh time in logs
+                try:
+                    riyadh_time_str = format_due_date_for_email(reminder_due_by)
+                    print(f"  reminder_due_by (Riyadh): {riyadh_time_str}")
+                except Exception as e:
+                    print(f"  ⚠️ Could not format Riyadh time: {e}")
+
                 if not email_should_be_processed(msg):
-                    print(f"  ⚠️ Already processed ({SENT_CATEGORY} exists). Skipping.")
+                    print(f"  ⚠️ Already processed ({SENT_CATEGORY}). Skipping.")
                     continue
 
-                is_due = is_due_soon(reminder_due_by, now_riyadh)
-                print(f"  Is due within 2 days? {is_due}")
-
-                if not is_due:
+                if not is_due_soon(reminder_due_by, now_riyadh):
                     print("  ℹ️ Not due yet. Skipping.")
                     continue
 
-                # ✅ Send reminder only to TO non-responders
-                if send_reminder_to_non_responders(account, msg):
-                    try:
-                        msg.refresh()
-                        msg.categories = add_sent_category(categories, SENT_CATEGORY)
-                        msg.save(update_fields=['categories'])
-                        reminder_count += 1
-                        print("  ✅ Reminder marked as sent.")
-                    except Exception as e:
-                        print(f"⚠️ Could not save category due to ChangeKey issue: {e}")
+                non_responders = get_non_responders(msg, account)
+                if send_reminder_to_non_responders(msg, non_responders, account):
+                    msg.refresh()
+                    msg.categories = add_sent_category(msg.categories or [], SENT_CATEGORY)
+                    msg.save(update_fields=['categories'])
+                    reminder_count += 1
+                    print("  ✅ Reminder marked as sent.")
 
             except Exception as e:
                 print(f"❌ Error processing '{getattr(msg, 'subject', 'unknown')}': {e}")
@@ -246,7 +281,7 @@ def main():
                 continue
 
         print(f"\n📊 Summary:")
-        print(f"  - Total messages: {total_count}")
+        print(f"  - Total messages: {len(messages)}")
         print(f"  - Flagged with due dates: {flagged_count}")
         print(f"  - Reminders sent: {reminder_count}")
 
@@ -257,7 +292,7 @@ def main():
 
 
 # ================================================
-# 🏁 Entry Point
+# 🎯 Entry Point
 # ================================================
 if __name__ == "__main__":
     main()
